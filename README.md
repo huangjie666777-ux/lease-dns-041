@@ -81,3 +81,60 @@ curl http://127.0.0.1:<启动日志中的端口>/healthz
 使用.NET SDK8.0.421。NuGet依赖版本保存在锁文件中，项目缓存为本目录.packages。tests/SubnetPlanner.Tests包含xUnit和ASP.NET Core集成测试。
 
 默认仅监听本机，由系统分配空闲端口，实际地址见启动日志；也可通过--urls指定空闲端口。
+
+# DHCP实验
+
+在子网规划服务之上增加了内存版DHCPv4实验服务：客户端通过标准DHCP报文从规划网段获取、续租和归还地址。仅绑定127.0.0.1的可配置高端口（默认6767），不操作网卡、不发送广播。
+
+## 管理接口
+
+### POST /dhcp/activate
+请求体为原/plan规划输入，外加三个字段：
+
+- `departmentId`：要启用地址池的部门ID，必须出现在规划结果中。
+- `offerSeconds`：报价有效期（正整数秒）。
+- `leaseSeconds`：租约时长（正整数秒）。
+
+规划成功后仅启用该部门的可用主机范围（firstUsable~lastUsable），全网同时只启用一个池。存在未过期报价或租约时返回409拒绝替换；非法请求（400/422）不影响旧池。成功响应示例：
+
+```json
+{ "activated": true, "departmentId": "eng", "cidr": "10.20.0.64/26",
+  "firstUsable": "10.20.0.65", "lastUsable": "10.20.0.126",
+  "offerSeconds": 30, "leaseSeconds": 300 }
+```
+
+### GET /dhcp/status
+返回当前池状态：是否激活、部门、地址范围、未过期报价与租约列表（MAC、地址、到期时间）。
+
+## 协议范围
+
+- 标准DHCPv4二进制报文（RFC2131/RFC2132），UDP收发，回复请求源端点。
+- 校验固定头（op/htype/hlen，仅以太网6字节MAC）、magic cookie与选项长度；畸形报文直接忽略，不改变状态、不终止服务。
+- 支持DISCOVER、选择阶段REQUEST（含服务器标识）、续租REQUEST（ciaddr）与RELEASE，其余消息类型忽略。
+- DISCOVER优先复用该MAC已有地址，否则分配最小空闲地址并限时报价；池耗尽不报价。
+- REQUEST选择本服务器且匹配报价时确认租约（ACK），不匹配返回NAK，选择其他服务器不响应；重复确认返回原租约。
+- 续租通过ciaddr核对MAC归属后延长租期；RELEASE只能归还自身地址，按协议无响应。
+- 响应保留事务ID与客户端MAC，按类型编码服务器标识（54）、地址、子网掩码（1）与租期（51）。
+- 租约保存在内存，到期自动回收，重启清空；并发分配不会一址多租。
+
+## 运行与演示
+
+```bash
+dotnet restore --locked-mode
+dotnet test
+dotnet build
+dotnet run --project src/SubnetPlanner.Api -- --urls http://127.0.0.1:5180
+# DHCP UDP端口由appsettings.json的Dhcp:Port配置（默认6767，0表示系统分配）
+
+# 激活eng部门的地址池
+curl --noproxy '*' -X POST http://127.0.0.1:5180/dhcp/activate -H 'Content-Type: application/json' -d '{
+  "parentCidr":"10.20.0.0/24",
+  "departments":[{"id":"eng","hosts":50}],
+  "departmentId":"eng","offerSeconds":30,"leaseSeconds":300}'
+
+# 本机演示客户端：获取 -> 续租 -> 释放
+dotnet run --project src/DhcpDemo.Client -- --port 6767 --mac 02:00:00:00:00:01
+
+# 查看池状态
+curl --noproxy '*' http://127.0.0.1:5180/dhcp/status
+```
